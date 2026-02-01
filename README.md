@@ -20,8 +20,15 @@ Track:
 Clip:
 - Position and length
 - Crossfading
-- Mute / Volume / Pan
+- Volume / Mute / Pan
 - Volume envelope
+- Pan envelope
+
+Routing:
+- Bus output routing and sends 
+- Send Volume envelope
+- Send Pan envelope
+- Send Mute envelope
 
 ## Installation
 
