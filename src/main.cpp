@@ -71,7 +71,30 @@ struct MarkerInfo {
     int index;
 };
 
+struct SendInfo {
+    std::string destID;
+    bool preFader;
+    float volume;
+    float pan;
+    std::vector<Keyframe> muteKeyframes;
+    std::vector<Keyframe> volumeKeyframes;
+    std::vector<Keyframe> panKeyframes;
+};
+
+struct ReceiveInfo {
+    int sourceIndex;
+    int mode; // 0=Post Fader, 1=Pre FX, 3=Pre Fader
+    float volume;
+    float pan;
+    std::vector<Keyframe> muteKeyframes;
+    std::vector<Keyframe> volumeKeyframes;
+    std::vector<Keyframe> panKeyframes;
+};
+
 struct TrackInfo {
+    std::string id;
+    std::string outputID;
+    bool isBus;
     std::string name;
     float hue;
     int peakcol;
@@ -86,6 +109,14 @@ struct TrackInfo {
     std::vector<Keyframe> volumeKeyframes;
     std::vector<Keyframe> panKeyframes;
     std::vector<Keyframe> muteKeyframes;
+    std::vector<SendInfo> sends;
+    std::vector<ReceiveInfo> receives;
+};
+
+struct MasterTrackInfo {
+    std::string id;
+    bool visible;
+    float volume;
 };
 
 // --- Helper Functions ---
@@ -125,6 +156,8 @@ void HSVtoRGB(float h, float s, float v, int& r, int& g, int& b) {
 }
 
 int hue_to_peakcol(float track_hue) {
+    if (track_hue == -1)
+      return 16576; // Default colour
     float hue = fmod(track_hue, 360.0f);
     float saturation = 0.5f;
     float value = 1.0f;
@@ -189,6 +222,38 @@ int kf_type_to_reaper_shape(const std::string& type) {
     if (type == "hold") return 1;
     if (type == "bezier") return 5;
     return 0; // Default to linear
+}
+
+void add_threshold_envelope_points(ProjectStateContext* genstate, const std::vector<Keyframe>& keyframes, int sampleRate) {
+    if (keyframes.empty()) return;
+
+    // Initial State Evaluation
+    double firstVal = keyframes[0].value;
+    int currentState = (firstVal > 0.5) ? 1 : 0;
+    double firstTime = (double)keyframes[0].sampleOffset / sampleRate;
+    genstate->AddLine("PT %.6f %d.000000 1 0 0 0", firstTime, currentState);
+
+    // Pairwise Crossing Calculation
+    for (size_t i = 1; i < keyframes.size(); ++i) {
+        const auto& kf1 = keyframes[i - 1];
+        const auto& kf2 = keyframes[i];
+
+        int newState = (kf2.value > 0.5) ? 1 : 0;
+
+        if (newState != currentState) {
+            // Calculate crossing time: t_cross = t1 + (0.5 - v1) * (t2 - t1) / (v2 - v1)
+            double t1 = (double)kf1.sampleOffset / sampleRate;
+            double t2 = (double)kf2.sampleOffset / sampleRate;
+            double v1 = kf1.value;
+            double v2 = kf2.value;
+
+            if (std::abs(v2 - v1) > 0.000001) {
+                double t_cross = t1 + (0.5 - v1) * (t2 - t1) / (v2 - v1);
+                genstate->AddLine("PT %.6f %d.000000 1 0 0 0", t_cross, newState);
+            }
+            currentState = newState;
+        }
+    }
 }
 
 std::string get_source_format(const std::string& extension, const std::string& fullPath = "") {
@@ -438,48 +503,155 @@ int LoadProject(const char *fn, ProjectStateContext *genstate)
     }
 
     // --- 3. Track & Clip Parsing ---
+    std::map<std::string, int> auditionIDToReaperIndex;
+    int currentTrackIndex = 0;
+
+    pugi::xml_node tracksNode = doc.select_node("//tracks").node();
+    if (!tracksNode) return -1;
+
+    // Pass 1: Build ID map for all audio and bus tracks
+    for (pugi::xml_node trackNode : tracksNode.children()) {
+        std::string nodeName = trackNode.name();
+        if (nodeName == "audioTrack" || nodeName == "busTrack") {
+            std::string id = trackNode.attribute("id").as_string();
+            if (!id.empty()) {
+                auditionIDToReaperIndex[id] = currentTrackIndex++;
+            }
+        }
+    }
+
     std::vector<TrackInfo> tracks;
-    pugi::xpath_node_set audioTracks = doc.select_nodes("//audioTrack");
+    // We will now iterate through tracks again to parse them fully.
+    // To ensure order matches Pass 1, we iterate through children of tracksNode.
 
-    for (pugi::xpath_node xpath_node : audioTracks) {
-        pugi::xml_node audioTrack = xpath_node.node();
+    MasterTrackInfo masterInfo;
+    masterInfo.id = "10000"; // Default fallback
+    masterInfo.visible = true;
+    masterInfo.volume = 1.0f;
+
+    pugi::xml_node masterNode = doc.select_node("//masterTrack").node();
+    if (masterNode) {
+        masterInfo.id = masterNode.attribute("id").as_string("10000");
+        masterInfo.visible = masterNode.attribute("visible").as_bool(true);
+        pugi::xml_node volComp = masterNode.select_node(".//component[@componentID='Audition.Fader'][@name='volume']").node();
+        if (volComp) {
+            masterInfo.volume = volComp.select_node(".//parameter[@name='volume']").node().attribute("parameterValue").as_float(1.0f);
+        }
+    }
+
+    for (pugi::xml_node trackNode : tracksNode.children()) {
+        std::string nodeName = trackNode.name();
+        if (nodeName != "audioTrack" && nodeName != "busTrack") continue;
+
         TrackInfo info;
+        info.id = trackNode.attribute("id").as_string();
+        info.isBus = (nodeName == "busTrack");
 
-        info.name = audioTrack.child("trackParameters").child("name").text().get();
-        if (info.name.empty()) info.name = "Track";
+        info.name = trackNode.child("trackParameters").child("name").text().get();
+        if (info.name.empty()) info.name = (info.isBus ? "Bus" : "Track");
 
-        info.hue = audioTrack.child("trackParameters").attribute("trackHue").as_float(0.0f);
+        info.hue = trackNode.child("trackParameters").attribute("trackHue").as_float(0.0f);
         info.peakcol = hue_to_peakcol(info.hue);
 
-        pugi::xml_node audioParams = audioTrack.child("trackAudioParameters");
+        pugi::xml_node audioParams = trackNode.child("trackAudioParameters");
         info.solo = get_track_audio_param(audioParams, "solo") != 0;
         info.armed = get_track_audio_param(audioParams, "recordArmed") != 0;
         info.monitoring = get_track_audio_param(audioParams, "monitoring") != 0;
         info.automationMode = get_track_audio_param(audioParams, "automationMode");
-        info.mute = false;
         
-        pugi::xml_node muteComp = audioTrack.select_node(".//component[@componentID='Audition.Mute']").node();
+        info.outputID = audioParams.child("trackOutput").attribute("outputID").as_string();
+
+        info.mute = false;
+        pugi::xml_node muteComp = trackNode.select_node(".//component[@componentID='Audition.Mute']").node();
         if (muteComp) {
             info.mute = muteComp.select_node(".//parameter[@name='mute']").node().attribute("parameterValue").as_int(0) != 0;
         }
 
         info.volume = 1.0f;
-        pugi::xml_node volComp = audioTrack.select_node(".//component[@componentID='Audition.Fader'][@name='volume']").node();
+        pugi::xml_node volComp = trackNode.select_node(".//component[@componentID='Audition.Fader'][@name='volume']").node();
         if (volComp) {
             info.volume = volComp.select_node(".//parameter[@name='volume']").node().attribute("parameterValue").as_float(1.0f);
         }
 
         info.pan = 0.0f;
-        pugi::xml_node panComp = audioTrack.select_node(".//component[@componentID='Audition.StereoPanner']").node();
+        pugi::xml_node panComp = trackNode.select_node(".//component[@componentID='Audition.StereoPanner']").node();
         if (panComp) {
             info.pan = panComp.select_node(".//parameter[@name='Pan']").node().attribute("parameterValue").as_float(0.0f) / 100.0f;
         }
 
-        extract_volume_keyframes(audioTrack, info.volumeKeyframes);
-        extract_pan_keyframes(audioTrack, info.panKeyframes);
-        extract_mute_keyframes(audioTrack, info.muteKeyframes);
+        extract_volume_keyframes(trackNode, info.volumeKeyframes);
+        extract_pan_keyframes(trackNode, info.panKeyframes);
+        extract_mute_keyframes(trackNode, info.muteKeyframes);
 
-        pugi::xpath_node_set clipNodes = audioTrack.select_nodes("audioClip");
+        // Parse auxiliary sends
+        pugi::xml_node sendList = trackNode.child("sendList");
+        if (sendList) {
+            for (pugi::xml_node sendSlot : sendList.children("sendSlot")) {
+                SendInfo send;
+                send.destID = sendSlot.attribute("sendOutputID").as_string();
+                send.preFader = sendSlot.attribute("preFader").as_bool(false);
+                send.volume = 1.0f;
+                send.pan = 0.0f;
+                
+                pugi::xml_node sendComp = sendSlot.select_node(".//component[@componentID='Audition.Send']").node();
+                if (sendComp) {
+                    send.volume = sendComp.select_node(".//parameter[@name='Level']").node().attribute("parameterValue").as_float(1.0f);
+                    
+                    // Send Power (Mute) Envelopes
+                    pugi::xml_node powerParam = sendComp.select_node(".//parameter[@name='Power On/Off']").node();
+                    if (powerParam) {
+                        pugi::xml_node kfContainer = powerParam.child("parameterKeyframes");
+                        if (kfContainer) {
+                            for (pugi::xml_node kfNode : kfContainer.children("parameterKeyframe")) {
+                                Keyframe kf;
+                                kf.sampleOffset = kfNode.attribute("sampleOffset").as_llong(0);
+                                kf.value = kfNode.attribute("value").as_double(1.0);
+                                kf.type = kfNode.attribute("type").as_string("linear");
+                                send.muteKeyframes.push_back(kf);
+                            }
+                        }
+                    }
+                    
+                    // Send Volume Envelopes
+                    pugi::xml_node levelParam = sendComp.select_node(".//parameter[@name='Level']").node();
+                    if (levelParam) {
+                        pugi::xml_node kfContainer = levelParam.child("parameterKeyframes");
+                        if (kfContainer) {
+                            for (pugi::xml_node kfNode : kfContainer.children("parameterKeyframe")) {
+                                Keyframe kf;
+                                kf.sampleOffset = kfNode.attribute("sampleOffset").as_llong(0);
+                                kf.value = kfNode.attribute("value").as_double(1.0);
+                                kf.type = kfNode.attribute("type").as_string("linear");
+                                send.volumeKeyframes.push_back(kf);
+                            }
+                        }
+                    }
+                }
+                
+                pugi::xml_node sendPanComp = sendSlot.select_node(".//component[@componentID='Audition.StereoPanner']").node();
+                if (sendPanComp) {
+                    send.pan = sendPanComp.select_node(".//parameter[@name='Pan']").node().attribute("parameterValue").as_float(0.0f) / 100.0f;
+                    
+                    pugi::xml_node panParam = sendPanComp.select_node(".//parameter[@name='Pan']").node();
+                    if (panParam) {
+                        pugi::xml_node kfContainer = panParam.child("parameterKeyframes");
+                        if (kfContainer) {
+                            for (pugi::xml_node kfNode : kfContainer.children("parameterKeyframe")) {
+                                Keyframe kf;
+                                kf.sampleOffset = kfNode.attribute("sampleOffset").as_llong(0);
+                                kf.value = kfNode.attribute("value").as_double(0.0);
+                                kf.type = kfNode.attribute("type").as_string("linear");
+                                send.panKeyframes.push_back(kf);
+                            }
+                        }
+                    }
+                }
+                
+                info.sends.push_back(send);
+            }
+        }
+
+        pugi::xpath_node_set clipNodes = trackNode.select_nodes("audioClip");
         for (pugi::xpath_node clip_xpath_node : clipNodes) {
             pugi::xml_node clipNode = clip_xpath_node.node();
             ClipInfo clip;
@@ -531,9 +703,46 @@ int LoadProject(const char *fn, ProjectStateContext *genstate)
         tracks.push_back(info);
     }
 
+    // Pass 3: Build receive map
+    for (int i = 0; i < (int)tracks.size(); ++i) {
+        const auto& sourceTrack = tracks[i];
+        
+        // Direct output
+        if (!sourceTrack.outputID.empty() && sourceTrack.outputID != masterInfo.id) {
+            if (auditionIDToReaperIndex.count(sourceTrack.outputID)) {
+                int destIdx = auditionIDToReaperIndex[sourceTrack.outputID];
+                ReceiveInfo rx;
+                rx.sourceIndex = i;
+                rx.mode = 0; // Post-Fader
+                rx.volume = 1.0f;
+                rx.pan = 0.0f;
+                tracks[destIdx].receives.push_back(rx);
+            }
+        }
+        
+        // Auxiliary sends
+        for (const auto& send : sourceTrack.sends) {
+            if (auditionIDToReaperIndex.count(send.destID)) {
+                int destIdx = auditionIDToReaperIndex[send.destID];
+                ReceiveInfo rx;
+                rx.sourceIndex = i;
+                rx.mode = send.preFader ? 3 : 0;
+                rx.volume = send.volume;
+                rx.pan = send.pan;
+                rx.muteKeyframes = send.muteKeyframes;
+                rx.volumeKeyframes = send.volumeKeyframes;
+                rx.panKeyframes = send.panKeyframes;
+                tracks[destIdx].receives.push_back(rx);
+            }
+        }
+    }
+
     // --- 4. Final RPP Generation ---
 
     genstate->AddLine("<REAPER_PROJECT 0.1");
+    genstate->AddLine("  SAMPLERATE %d 0 0", sampleRate);
+    genstate->AddLine("MASTERTRACKVIEW %d 0.6667 0.5 0.5 0 0 0 0 0 0 0 0 0 0 0", masterInfo.visible ? 1 : 0);
+    genstate->AddLine("MASTER_VOLUME %.14f 0 -1 -1 1", masterInfo.volume);
     
     // Write Markers and Regions
     for (const auto& marker : markerList) {
@@ -560,6 +769,63 @@ int LoadProject(const char *fn, ProjectStateContext *genstate)
         
         genstate->AddLine("REC %d 0 %d 0 0 0 0 0", track.armed ? 1 : 0, track.monitoring ? 1 : 0);
         genstate->AddLine("AUTOMODE %d", convert_sesx_automode_to_reaper(track.automationMode));
+
+        // Main Send
+        if (track.outputID == masterInfo.id || track.outputID.empty()) {
+            genstate->AddLine("MAINSEND 1 0");
+        } else {
+            genstate->AddLine("MAINSEND 0 0");
+        }
+
+        // Receives (Sends from other tracks)
+        for (const auto& rx : track.receives) {
+            genstate->AddLine("AUXRECV %d %d %.6f %.6f 0 0 0 0 0 -1:U 0 -1 ''", rx.sourceIndex, rx.mode, rx.volume, rx.pan);
+            
+            if (!rx.volumeKeyframes.empty()) {
+                genstate->AddLine("<AUXVOLENV");
+                genstate->AddLine("ACT 1 -1");
+                genstate->AddLine("VIS 1 1 1.0");
+                genstate->AddLine("LANEHEIGHT 0 0");
+                genstate->AddLine("ARM 0");
+                genstate->AddLine("DEFSHAPE 0 -1 -1");
+                genstate->AddLine("VOLTYPE 1");
+                for (const auto& kf : rx.volumeKeyframes) {
+                    double time = (double)kf.sampleOffset / sampleRate;
+                    double dummy;
+                    double val = convert_sesx_volume_to_volenv(kf.value, dummy);
+                    int shape = kf_type_to_reaper_shape(kf.type);
+                    genstate->AddLine("PT %.6f %.6f %d 0 0 0", time, val, shape);
+                }
+                genstate->AddLine(">");
+            }
+            
+            if (!rx.panKeyframes.empty()) {
+                genstate->AddLine("<AUXPANENV");
+                genstate->AddLine("ACT 1 -1");
+                genstate->AddLine("VIS 1 1 1.0");
+                genstate->AddLine("LANEHEIGHT 0 0");
+                genstate->AddLine("ARM 0");
+                genstate->AddLine("DEFSHAPE 0 -1 -1");
+                for (const auto& kf : rx.panKeyframes) {
+                    double time = (double)kf.sampleOffset / sampleRate;
+                    double val = convert_sesx_pan_to_reaper(kf.value);
+                    int shape = kf_type_to_reaper_shape(kf.type);
+                    genstate->AddLine("PT %.6f %.6f %d 0 0 0", time, val, shape);
+                }
+                genstate->AddLine(">");
+            }
+            
+            if (!rx.muteKeyframes.empty()) {
+                genstate->AddLine("<AUXMUTEENV");
+                genstate->AddLine("ACT 1 -1");
+                genstate->AddLine("VIS 1 1 1.0");
+                genstate->AddLine("LANEHEIGHT 0 0");
+                genstate->AddLine("ARM 0");
+                genstate->AddLine("DEFSHAPE 1 -1 -1");
+                add_threshold_envelope_points(genstate, rx.muteKeyframes, sampleRate);
+                genstate->AddLine(">");
+            }
+        }
 
         // Track Volume Envelope
         if (!track.volumeKeyframes.empty()) {

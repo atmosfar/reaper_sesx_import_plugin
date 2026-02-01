@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Source files
 set(SOURCES
     src/main.cpp
-    src/pugixml.cpp
+    include/pugixml/pugixml.cpp
 )
 
 # Create the shared library
@@ -16,6 +16,7 @@ add_library(${PROJECT_NAME} SHARED ${SOURCES})
 # Include directories
 target_include_directories(${PROJECT_NAME} PRIVATE
     include/reaper_sdk
+    include/pugixml
 )
 
 # Reaper plugins have specific naming conventions based on the platform.
